@@ -1,8 +1,10 @@
 import sys
-from typing import List, Generator, Any, Union, Tuple, Callable, Sequence
+from typing import List, Generator, Any, Union, Tuple, Sequence
 from pathlib import Path
 import os
 import subprocess
+import re
+from .parser import parse_command
 
 valid_commands = ["echo", "exit", "type", "pwd"]
 
@@ -11,8 +13,28 @@ def is_valid_command(command: str) -> bool:
     return command in valid_commands
 
 
+def string_literal_present(command: str) -> bool:
+    return bool(re.search(r"'[^']*'|\"[^\"]*\"", command))
+
+
+def cat_file(command_line: str, path: str) -> str:
+    file_contents = []
+    files_by_line = parse_command(command_line)
+    as_path = Path(path)
+    _file: str
+
+    for _file in files_by_line:
+        full_path = as_path / _file.strip()
+        if full_path.exists():
+            contents = full_path.read_text()
+            file_contents.append(contents)
+
+    joined_content = "".join(file_contents)
+    sys.stdout.write(joined_content)
+
+
 def parse_input(command: str) -> Tuple[str, str]:
-    head, *tail = command.split()
+    head, *tail = parse_command(command)
     return head, tail
 
 
@@ -20,19 +42,20 @@ def get_first_in_list(args: Sequence[str]) -> Union[str, None]:
     return next(iter(args), None)
 
 
+def default_predicate(target_file: str, f: Path) -> bool:
+    return f.exists() and f.name == target_file
+
+
 def scan_dirs(
     paths: List[Path],
     target_file: str,
-    predicate: Union[Callable[[Path], bool], None] = None,
 ) -> Union[Path, None]:
     target_file = target_file.strip()
-    if predicate is None:
-        predicate: Callable[[Path], bool] = (
-            lambda f: f.exists() and f.name == target_file
-        )
-
-    found_exe = (f for path in paths for f in path.iterdir() if predicate(f) )
+    found_exe = (
+        f for path in paths for f in path.iterdir() if default_predicate(target_file, f)
+    )
     return get_first_in_list(found_exe)
+
 
 def mk_path_on_init(raw_path_str: str) -> Generator[Path, Any, None]:
     paths = raw_path_str.split(":")
@@ -43,21 +66,25 @@ def mk_path_on_init(raw_path_str: str) -> Generator[Path, Any, None]:
         yield as_path
 
 
-def execute_and_find(command: str, paths: List[Path]) -> None:
-    my_exe, name = parse_input(command)
-    name = get_first_in_list(name)
+def execute_and_find(command: str, paths: List[Path]) -> bool:
+    my_exe, args = parse_input(command)
     to_call: Path = scan_dirs(paths, my_exe)
     if to_call is None:
-        return
-
-    result = subprocess.run([to_call, name], capture_output=True, text=True).stdout
-    sys.stdout.write(f"{result}")
+        return False
+    else:
+        args = [char for char in args if char not in {" ", ""}]
+        programs_args = [to_call.stem]
+        programs_args.extend(args)
+        result = subprocess.run(programs_args, capture_output=True, text=True).stdout
+        sys.stdout.write(f"{result}")
+        return True
 
 
 def get_type(command: str, paths: List[Path]):
-    _, _type = parse_input(command)
+    _type = parse_input(command)
     target_type = get_first_in_list(_type)
     valid_type = is_valid_command(target_type)
+
     if valid_type:
         sys.stdout.write(f"{target_type} is a shell builtin\n")
     elif (path := scan_dirs(paths, target_type)) and path is not None:
@@ -73,14 +100,15 @@ def move_dir(command: str):
     except OSError:
         print(f"cd: {target}: No such file or directory")
 
+
 def echo(command: str):
-    _, command = parse_input(command)
-    as_str = " ".join(command)
-    sys.stdout.write(f"{as_str}\n")
+    command = parse_command(command)
+    command = "".join(command)
+    sys.stdout.write(command + "\n")
 
 
 def main():
-    # Uncomment this block to pass the first stage
+    # This block is for testing
     if len(sys.argv) > 1:
         # for local testing
         _, PATH, *_ = sys.argv
@@ -92,13 +120,8 @@ def main():
     paths = list(mk_path_on_init(PATH))
 
     while True:
-        sys.stdout.write("$ ")
-        sys.stdout.flush()
-        # Wait for user input
         command: str = input()
-        if command.startswith("my_exe"):
-            execute_and_find(command, paths)
-        elif command.startswith("type"):
+        if command.startswith("type"):
             get_type(command, paths)
         elif command.startswith("exit"):
             break
@@ -108,8 +131,12 @@ def main():
             sys.stdout.write(f"{str(Path.cwd())}\n")
         elif command.startswith("cd"):
             move_dir(command)
+        elif command.startswith("cat"):
+            cat_file(command_line=command, path=PATH)
         else:
-            sys.stdout.write(f"{command}: command not found\n")
+            found = execute_and_find(command, paths)
+            if not found:
+                sys.stdout.write(f"{command}: command not found\n")
 
 
 if __name__ == "__main__":
