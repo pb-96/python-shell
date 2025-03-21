@@ -1,36 +1,97 @@
 import sys
-from typing import List, Generator, Any, Union, Tuple, Sequence
+from typing import List, Generator, Any, Union, Tuple, Sequence, cast, Dict
 from pathlib import Path
 import os
 import subprocess
 import re
 from .parser import parse_command
+from .write_cmds import process_write_cmd, append_to_file
+from .autocomplete import build_tree, search_tree, all_options
+import readline
+from functools import partial
+from collections.abc import Mapping
+import pathlib
+from typing import Final, TextIO
 
-valid_commands = ["echo", "exit", "type", "pwd"]
+SHELL_BUILTINS: Final[list[str]] = [
+    "echo",
+    "exit",
+    "type",
+    "pwd",
+    "cd",
+]
+
+PATH = os.environ.get("PATH")
+
+
+def parse_programs_in_path(path: str, programs: dict[str, pathlib.Path]) -> None:
+    """Creates a mapping of programs in path to their paths"""
+    for p, _, bins in pathlib.Path(path).walk():
+        for b in bins:
+            programs[b] = p / b
+
+
+def generate_program_paths() -> Mapping[str, pathlib.Path]:
+    programs: dict[str, pathlib.Path] = {}
+    for p in (os.getenv("PATH") or "").split(":"):
+        parse_programs_in_path(p, programs)
+    return programs
+
+
+PROGRAMS_IN_PATH: Final[Mapping[str, pathlib.Path]] = {**generate_program_paths()}
+PATHS = [*PROGRAMS_IN_PATH.values()]
+COMPLETIONS: Final[list[str]] = [*SHELL_BUILTINS, *PROGRAMS_IN_PATH.keys()]
+TREE = build_tree(COMPLETIONS)
+
+
+def display_matches(substitution, matches, longest_match_length):
+    print()
+    if matches:
+        print("  ".join(matches))
+    print("$ " + substitution, end="")
+
+
+def complete(text: str, state: int) -> str | None:
+    if state == 0:
+        options = list(search_tree(TREE, text))
+        if not options:
+            return " ".join((found for found in COMPLETIONS if found.startswith(text)))
+        return " ".join(options)
+    return None
+
+
+readline.set_completion_display_matches_hook(display_matches)
+readline.parse_and_bind("tab: complete")
+readline.set_completer(complete)
 
 
 def is_valid_command(command: str) -> bool:
-    return command in valid_commands
+    return command in SHELL_BUILTINS
 
 
 def string_literal_present(command: str) -> bool:
     return bool(re.search(r"'[^']*'|\"[^\"]*\"", command))
 
 
-def cat_file(command_line: str, path: str) -> str:
+def cat_file(command_line: str, paths: List[Path]) -> str:
     file_contents = []
-    files_by_line = parse_command(command_line)
-    as_path = Path(path)
-    _file: str
+    files_by_line = parse_command(command_line, False)
+    as_path = Path(get_first_in_list(paths))
 
+    _file: str
     for _file in files_by_line:
-        full_path = as_path / _file.strip()
-        if full_path.exists():
+        _file = _file.strip()
+        _path: Path = cast(Path, Path(_file))
+        if _file == "cat":
+            continue
+        elif _path.exists():
+            contents = _path.read_text()
+            file_contents.append(contents)
+        elif (full_path := as_path / _path) and full_path.exists():
             contents = full_path.read_text()
             file_contents.append(contents)
 
-    joined_content = "".join(file_contents)
-    sys.stdout.write(joined_content)
+    return "".join(file_contents)
 
 
 def parse_input(command: str) -> Tuple[str, str]:
@@ -51,46 +112,36 @@ def scan_dirs(
     target_file: str,
 ) -> Union[Path, None]:
     target_file = target_file.strip()
-    found_exe = (
-        f for path in paths for f in path.iterdir() if default_predicate(target_file, f)
-    )
+    found_exe = [*filter(lambda p: default_predicate(target_file, p), paths)]
     return get_first_in_list(found_exe)
 
 
-def mk_path_on_init(raw_path_str: str) -> Generator[Path, Any, None]:
-    paths = raw_path_str.split(":")
-    for _path in paths:
-        as_path = Path(_path)
-        if not as_path.exists():
-            as_path.mkdir(exist_ok=True)
-        yield as_path
-
-
-def execute_and_find(command: str, paths: List[Path]) -> bool:
+def execute_and_find(command: str, paths: List[Path]) -> Union[str, None]:
     my_exe, args = parse_input(command)
     to_call: Path = scan_dirs(paths, my_exe)
     if to_call is None:
-        return False
+        return None
     else:
         args = [char for char in args if char not in {" ", ""}]
         programs_args = [to_call.stem]
         programs_args.extend(args)
-        result = subprocess.run(programs_args, capture_output=True, text=True).stdout
-        sys.stdout.write(f"{result}")
-        return True
+        result = subprocess.run(
+            programs_args, capture_output=True, text=True
+        ).stdout.strip()
+        return result
 
 
-def get_type(command: str, paths: List[Path]):
+def get_type(command: str, paths: List[Path]) -> str:
     _type = parse_input(command)
     target_type = get_first_in_list(_type)
     valid_type = is_valid_command(target_type)
 
     if valid_type:
-        sys.stdout.write(f"{target_type} is a shell builtin\n")
+        return f"{target_type} is a shell builtin\n"
     elif (path := scan_dirs(paths, target_type)) and path is not None:
-        sys.stdout.write(f"{target_type} is {path}\n")
+        return f"{target_type} is {path}\n"
     else:
-        sys.stdout.write(f"{target_type}: not found\n")
+        return f"{target_type}: not found\n"
 
 
 def move_dir(command: str):
@@ -98,45 +149,54 @@ def move_dir(command: str):
     try:
         os.chdir(os.path.expanduser(target))
     except OSError:
-        print(f"cd: {target}: No such file or directory")
+        return f"cd: {target}: No such file or directory"
 
 
-def echo(command: str):
+def echo(command: str) -> str:
     command = parse_command(command)
     command = "".join(command)
-    sys.stdout.write(command + "\n")
+    return command + "\n"
+
+
+def state_machine(command: str, paths: List[Path]) -> str:
+    if command.startswith("type"):
+        return get_type(command, paths)
+    elif command.startswith("echo"):
+        return echo(command)
+    elif command.startswith("pwd"):
+        return f"{str(Path.cwd())}\n"
+    elif command.startswith("cd"):
+        return move_dir(command)
+    elif command.startswith("cat"):
+        return cat_file(command_line=command, paths=paths)
+    else:
+        found = execute_and_find(command, paths)
+        if found:
+            return found
+    return f"{command}: command not found\n"
 
 
 def main():
-    # This block is for testing
-    if len(sys.argv) > 1:
-        # for local testing
-        _, PATH, *_ = sys.argv
-        _, *path = PATH.split("=")
-        PATH = path[1:]
-    else:
-        PATH = os.environ.get("PATH")
-
-    paths = list(mk_path_on_init(PATH))
 
     while True:
+        sys.stdout.write("$ ")
+        sys.stdout.flush()
+
         command: str = input()
-        if command.startswith("type"):
-            get_type(command, paths)
+        if ">>" in command:
+            append_to_file(command)
+        elif ">" in command or "<" in command:
+            process_write_cmd(command)
         elif command.startswith("exit"):
             break
-        elif command.startswith("echo"):
-            echo(command)
-        elif command.startswith("pwd"):
-            sys.stdout.write(f"{str(Path.cwd())}\n")
-        elif command.startswith("cd"):
-            move_dir(command)
-        elif command.startswith("cat"):
-            cat_file(command_line=command, path=PATH)
         else:
-            found = execute_and_find(command, paths)
-            if not found:
-                sys.stdout.write(f"{command}: command not found\n")
+            to_display = state_machine(command, paths=PATHS)
+            if to_display is None:
+                continue
+            if not to_display.endswith("\n"):
+                to_display += "\n"
+            sys.stdout.write(to_display)
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":
